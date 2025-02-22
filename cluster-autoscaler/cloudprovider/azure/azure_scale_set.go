@@ -17,6 +17,8 @@ limitations under the License.
 package azure
 
 import (
+	"context"
+	"errors"
 	"fmt"
 	"math/rand"
 	"strings"
@@ -268,7 +270,7 @@ func (scaleSet *ScaleSet) getScaleSetSize() (int64, error) {
 }
 
 // waitForCreateOrUpdate waits for the outcome of VMSS capacity update initiated via CreateOrUpdateAsync.
-func (scaleSet *ScaleSet) waitForCreateOrUpdateInstances(future *azure.Future) {
+func (scaleSet *ScaleSet) waitForCreateOrUpdateInstances(ctx context.Context, cancel context.CancelFunc, future *azure.Future) error {
 	var err error
 
 	defer func() {
@@ -282,19 +284,18 @@ func (scaleSet *ScaleSet) waitForCreateOrUpdateInstances(future *azure.Future) {
 		}
 	}()
 
-	ctx, cancel := getContextWithTimeout(asyncContextTimeout)
-	defer cancel()
-
-	klog.V(3).Infof("Calling virtualMachineScaleSetsClient.WaitForCreateOrUpdateResult(%s)", scaleSet.Name)
+	deadline, _ := ctx.Deadline()
+	klog.V(3).Infof("Waiting virtualMachineScaleSetsClient.WaitForCreateOrUpdateResult(%s) for %s", scaleSet.Name, deadline.Sub(time.Now()).Round(time.Second))
 	httpResponse, err := scaleSet.manager.azClient.virtualMachineScaleSetsClient.WaitForCreateOrUpdateResult(ctx, future, scaleSet.manager.config.ResourceGroup)
 
 	isSuccess, err := isSuccessHTTPResponse(httpResponse, err)
 	if isSuccess {
 		klog.V(3).Infof("waitForCreateOrUpdateInstances(%s) success", scaleSet.Name)
-		return
+		return nil
 	}
 
 	klog.Errorf("waitForCreateOrUpdateInstances(%s) failed, err: %v", scaleSet.Name, err)
+	return err
 }
 
 // setScaleSetSize sets ScaleSet size.
@@ -477,8 +478,24 @@ func (scaleSet *ScaleSet) createOrUpdateInstances(vmssInfo *compute.VirtualMachi
 	scaleSet.curSize = newSize
 	scaleSet.lastSizeRefresh = time.Now()
 
-	go scaleSet.waitForCreateOrUpdateInstances(future)
-	return nil
+	// Wait the outcome of VMSS capacity update until the context timeout expires (best effort).
+	err := scaleSet.waitForCreateOrUpdateInstances(ctx, cancel, future)
+	if err == nil {
+		return nil
+	}
+
+	// Switch to async wait for the outcome of VMSS capacity update.
+	klog.V(3).Infof("waitForCreateOrUpdateInstances for scale set %q defered", scaleSet.Name)
+	if errors.Is(err, context.DeadlineExceeded) {
+		go func() {
+			ctx, cancel := getContextWithTimeout(asyncContextTimeout)
+			defer cancel()
+			_ = scaleSet.waitForCreateOrUpdateInstances(ctx, cancel, future)
+		}()
+		return nil
+	}
+
+	return err
 }
 
 // DeleteInstances deletes the given instances. All instances must be controlled by the same nodegroup.
