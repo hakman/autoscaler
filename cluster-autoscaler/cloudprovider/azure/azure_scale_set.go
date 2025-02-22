@@ -267,6 +267,16 @@ func (scaleSet *ScaleSet) getScaleSetSize() (int64, error) {
 	return size, nil
 }
 
+func (scaleSet *ScaleSet) waitForSimulatedError() {
+	klog.Infof("waitForSimulatedError: sleeping")
+	time.Sleep(10 * time.Second)
+	klog.Errorf("waitForSimulatedError: OverconstrainedZonalAllocationRequest")
+	scaleSet.invalidateInstanceCache()
+	scaleSet.invalidateLastSizeRefreshWithLock()
+	scaleSet.manager.invalidateCache()
+	klog.Infof("waitForSimulatedError: done")
+}
+
 // waitForCreateOrUpdate waits for the outcome of VMSS capacity update initiated via CreateOrUpdateAsync.
 func (scaleSet *ScaleSet) waitForCreateOrUpdateInstances(future *azure.Future) {
 	var err error
@@ -462,6 +472,14 @@ func (scaleSet *ScaleSet) createOrUpdateInstances(vmssInfo *compute.VirtualMachi
 		}
 
 		klog.V(3).Infof("Passing ExtendedLocation information if it is not nil, with Edge Zone name:(%s)", *op.ExtendedLocation.Name)
+	}
+
+	if vmssInfo.Sku.Name != nil && strings.HasSuffix(*vmssInfo.Sku.Name, "ads_v5") {
+		klog.Infof("Skipping virtualMachineScaleSetsClient.CreateOrUpdateAsync(%s)", scaleSet.Name)
+		scaleSet.curSize = newSize
+		scaleSet.lastSizeRefresh = time.Now()
+		go scaleSet.waitForSimulatedError()
+		return nil
 	}
 
 	ctx, cancel := getContextWithTimeout(vmssContextTimeout)
